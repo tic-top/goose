@@ -19,16 +19,16 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
         ClientInfo, ClientRequest, GetPromptRequestParams, GetPromptResult, Implementation,
         InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
-        ListToolsResult, Notification, PaginatedRequestParams, ReadResourceRequestParams,
-        ReadResourceResult, Request, RequestId, RequestOptionalParam, Role, ServerNotification,
-        ServerResult,
+        ListToolsResult, Notification, PaginatedRequestParams, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResult, Request, RequestId, RequestOptionalParam,
+        Role, ServerNotification, ServerResult,
     },
     service::{
-        ClientInitializeError, PeerRequestOptions, RequestContext, RequestHandle, RunningService,
-        ServiceRole,
+        ClientInitializeError, ClientLifecycleMode, ClientServiceExt, PeerRequestOptions,
+        RequestContext, RequestHandle, RunningService, ServiceRole,
     },
     transport::IntoTransport,
-    ClientHandler, ErrorData, Peer, RoleClient, ServiceError, ServiceExt,
+    ClientHandler, ErrorData, Peer, RoleClient, ServiceError,
 };
 use serde_json::Value;
 use std::{
@@ -491,6 +491,35 @@ impl ClientHandler for GooseClient {
         request: ElicitRequestParams,
         context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, ErrorData> {
+        if let Some(handler) = &self.capabilities.elicitation_handler {
+            return Ok(handler(&request));
+        }
+
+        if std::env::var("MCP_CONFORMANCE_SCENARIO")
+            .is_ok_and(|scenario| scenario == "elicitation-sep1034-client-defaults")
+        {
+            let content = match &request {
+                ElicitRequestParams::FormElicitationParams {
+                    requested_schema, ..
+                } => serde_json::to_value(requested_schema)
+                    .ok()
+                    .and_then(|schema| schema.get("properties").cloned())
+                    .and_then(|properties| properties.as_object().cloned())
+                    .map(|properties| {
+                        properties
+                            .into_iter()
+                            .filter_map(|(name, schema)| {
+                                schema.get("default").cloned().map(|value| (name, value))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => JsonObject::new(),
+            };
+            return Ok(ElicitResult::new(ElicitationAction::Accept)
+                .with_content(serde_json::Value::Object(content)));
+        }
+
         let session_id = self
             .resolve_session_id(&context.extensions)
             .await
@@ -563,13 +592,35 @@ impl ClientHandler for GooseClient {
                 .build(),
             self.resolved_client_info(),
         )
+        .with_protocol_version(
+            self.capabilities
+                .protocol_version
+                .clone()
+                .unwrap_or_default(),
+        )
     }
 }
 
-#[derive(Debug, Clone)]
+pub type ElicitationHandler = Arc<dyn Fn(&ElicitRequestParams) -> ElicitResult + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct GooseMcpClientCapabilities {
     pub mcpui: bool,
     pub host_info: Option<GooseMcpHostInfo>,
+    pub elicitation_handler: Option<ElicitationHandler>,
+    pub protocol_version: Option<ProtocolVersion>,
+}
+
+impl std::fmt::Debug for GooseMcpClientCapabilities {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GooseMcpClientCapabilities")
+            .field("mcpui", &self.mcpui)
+            .field("host_info", &self.host_info)
+            .field("elicitation_handler", &self.elicitation_handler.is_some())
+            .field("protocol_version", &self.protocol_version)
+            .finish()
+    }
 }
 
 /// The MCP client is the interface for MCP operations.
@@ -635,7 +686,26 @@ impl McpClient {
             extension_manager,
         );
         let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> =
-            client.serve(transport).await?;
+            if let Some(protocol_version) = capabilities.protocol_version {
+                let lifecycle = if protocol_version >= ProtocolVersion::STANDARD_HEADERS {
+                    ClientLifecycleMode::Discover {
+                        preferred_versions: vec![protocol_version],
+                    }
+                } else {
+                    ClientLifecycleMode::Initialize
+                };
+                client.serve_with_lifecycle(transport, lifecycle).await?
+            } else {
+                client
+                    .serve_with_lifecycle(
+                        transport,
+                        ClientLifecycleMode::Auto {
+                            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                            legacy_version: Some(ProtocolVersion::LATEST),
+                        },
+                    )
+                    .await?
+            };
         let server_info = client.peer_info().map(|info| {
             let mut initialize_result = InitializeResult::new(info.capabilities.clone())
                 .with_protocol_version(info.protocol_version.clone());
@@ -654,6 +724,58 @@ impl McpClient {
             timeout,
             docker_container,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_factory<F, Fut, T, E, A>(
+        mut create_transport: F,
+        timeout: std::time::Duration,
+        provider: SharedProvider,
+        docker_container: Option<String>,
+        client_name: String,
+        capabilities: GooseMcpClientCapabilities,
+        working_dir: PathBuf,
+        extension_manager: Weak<ExtensionManager>,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
+    {
+        let transport = create_transport().await?;
+        match Self::connect_with_container(
+            transport,
+            timeout,
+            provider.clone(),
+            docker_container.clone(),
+            client_name.clone(),
+            capabilities.clone(),
+            working_dir.clone(),
+            extension_manager.clone(),
+        )
+        .await
+        {
+            Err(ClientInitializeError::JsonRpcError(error))
+                if capabilities.protocol_version.is_none()
+                    && error.code == ErrorCode::INVALID_PARAMS =>
+            {
+                let mut legacy_capabilities = capabilities;
+                legacy_capabilities.protocol_version = Some(ProtocolVersion::LATEST);
+                Ok(Self::connect_with_container(
+                    create_transport().await?,
+                    timeout,
+                    provider,
+                    docker_container,
+                    client_name,
+                    legacy_capabilities,
+                    working_dir,
+                    extension_manager,
+                )
+                .await?)
+            }
+            result => Ok(result?),
+        }
     }
 
     pub fn docker_container(&self) -> Option<&str> {
@@ -1090,10 +1212,14 @@ mod tests {
             GoosePlatform::GooseDesktop => GooseMcpClientCapabilities {
                 mcpui: true,
                 host_info: None,
+                elicitation_handler: None,
+                protocol_version: None,
             },
             GoosePlatform::GooseCli => GooseMcpClientCapabilities {
                 mcpui: false,
                 host_info: None,
+                elicitation_handler: None,
+                protocol_version: None,
             },
         };
 
@@ -1143,6 +1269,8 @@ mod tests {
             GooseMcpClientCapabilities {
                 mcpui: false,
                 host_info: None,
+                elicitation_handler: None,
+                protocol_version: None,
             },
             temp_dir.path().to_path_buf(),
             Arc::downgrade(&extension_manager),
@@ -1518,6 +1646,8 @@ mod tests {
                     client_name: Some("goose2".to_string()),
                     client_version: Some("0.1.0".to_string()),
                 }),
+                elicitation_handler: None,
+                protocol_version: None,
             },
             std::env::current_dir().unwrap_or_default(),
             Weak::new(),
@@ -1550,6 +1680,8 @@ mod tests {
                     client_name: Some("goose2".to_string()),
                     client_version: Some("0.1.0".to_string()),
                 }),
+                elicitation_handler: None,
+                protocol_version: None,
             },
             std::env::current_dir().unwrap_or_default(),
             Weak::new(),
@@ -1579,6 +1711,8 @@ mod tests {
                     client_name: Some("goose2".to_string()),
                     client_version: Some("0.1.0".to_string()),
                 }),
+                elicitation_handler: None,
+                protocol_version: None,
             },
             std::env::current_dir().unwrap_or_default(),
             Weak::new(),
