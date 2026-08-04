@@ -27,6 +27,11 @@ pub enum ProviderError {
     #[error("Request failed: {0}")]
     RequestFailed(String),
 
+    /// Bad input rather than an operational failure: retrying is pointless, but
+    /// a different value may succeed.
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+
     #[error("Execution error: {0}")]
     ExecutionError(String),
 
@@ -65,6 +70,7 @@ impl ProviderError {
             ProviderError::ServerError(_) => "server",
             ProviderError::NetworkError(_) => "network",
             ProviderError::RequestFailed(_) => "request",
+            ProviderError::InvalidValue(_) => "invalid_value",
             ProviderError::ExecutionError(_) => "execution",
             ProviderError::UsageError(_) => "usage",
             ProviderError::NotImplemented(_) => "not_implemented",
