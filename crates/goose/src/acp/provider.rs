@@ -177,11 +177,11 @@ pub struct AcpProvider {
 
     /// The agent's thinking-effort config option, mirrored from every
     /// config-options payload it sends. `None` means the agent offers no effort
-    /// selector for its current model.
+    /// selector for its current model. Its `current` value doubles as the
+    /// redundant-send guard: unlike a goose-side cache of the last applied
+    /// value, it tracks the agent resetting its own effort (e.g. on a model
+    /// switch), so the persisted value is re-applied when that happens.
     effort_state: Arc<Mutex<Option<ThinkingEffortCapability>>>,
-    /// Effort value currently applied via the agent's effort option, used to
-    /// avoid redundant `SetConfigOption` calls.
-    applied_effort: Arc<Mutex<Option<String>>>,
 
     tx: Option<mpsc::Sender<ClientRequest>>,
     loop_thread: Option<JoinHandle<()>>,
@@ -305,7 +305,6 @@ impl AcpProvider {
             model_config_option_id,
             applied_model: Arc::new(Mutex::new(applied_model)),
             effort_state,
-            applied_effort: Arc::new(Mutex::new(None)),
             tx: Some(tx),
             loop_thread: Some(loop_thread),
         })
@@ -394,6 +393,10 @@ impl AcpProvider {
             .clone())
     }
 
+    /// The redundant-send guard is the mirrored capability's `current`, not a
+    /// goose-side record of the last sent value: the agent's `SetConfigOption`
+    /// response refreshes `effort_state` before this call returns, and later
+    /// refreshes track the agent resetting its own effort.
     async fn set_effort_option(
         &self,
         goose_id: &str,
@@ -401,30 +404,27 @@ impl AcpProvider {
         value: String,
     ) -> Result<()> {
         {
-            let applied = self
-                .applied_effort
+            let state = self
+                .effort_state
                 .lock()
-                .map_err(|_| anyhow::anyhow!("applied_effort lock poisoned"))?;
-            if applied.as_deref() == Some(value.as_str()) {
+                .map_err(|_| anyhow::anyhow!("effort_state lock poisoned"))?;
+            let current = state
+                .as_ref()
+                .and_then(|capability| capability.current.as_deref());
+            if current == Some(value.as_str()) {
                 return Ok(());
             }
         }
 
-        self.send_set_config_option(goose_id, option_id.to_string(), value.clone())
-            .await?;
-
-        let mut applied = self
-            .applied_effort
-            .lock()
-            .map_err(|_| anyhow::anyhow!("applied_effort lock poisoned"))?;
-        *applied = Some(value);
-        Ok(())
+        self.send_set_config_option(goose_id, option_id.to_string(), value)
+            .await
     }
 
     /// Forward the session's persisted thinking effort to the agent when it
-    /// differs from what was last applied. A recreated provider (model switch,
-    /// provider switch, session reload) starts from the agent's own default, so
-    /// the persisted value has to be re-applied rather than assumed.
+    /// differs from the agent's mirrored current value. A recreated provider
+    /// (model switch, provider switch, session reload) starts from the agent's
+    /// own default, so the persisted value has to be re-applied rather than
+    /// assumed.
     async fn apply_effort_if_changed(&self, model_config: &ModelConfig) -> Result<()> {
         let Some(value) = model_config.request_param::<String>(THINKING_EFFORT_PARAM) else {
             return Ok(());
@@ -1927,7 +1927,6 @@ mod tests {
                 model_config_option_id: None,
                 applied_model: Arc::new(Mutex::new(None)),
                 effort_state: Arc::new(Mutex::new(None)),
-                applied_effort: Arc::new(Mutex::new(None)),
                 tx,
                 loop_thread: None,
             },
@@ -2337,11 +2336,9 @@ mod tests {
     fn test_provider_with_effort(
         tx: mpsc::Sender<ClientRequest>,
         capability: Option<ThinkingEffortCapability>,
-        applied_effort: Option<String>,
     ) -> AcpProvider {
         let (provider, _) = test_provider_with_tx(Some(tx));
         *provider.effort_state.lock().unwrap() = capability;
-        *provider.applied_effort.lock().unwrap() = applied_effort;
         provider
     }
 
@@ -2567,7 +2564,7 @@ mod tests {
     fn thinking_effort_support_reports_agent_options() {
         let (tx, _rx) = mpsc::channel(1);
         let capability = effort_capability(&["default", "high"], "default");
-        let provider = test_provider_with_effort(tx, Some(capability.clone()), None);
+        let provider = test_provider_with_effort(tx, Some(capability.clone()));
 
         assert_eq!(
             provider.thinking_effort_support(),
@@ -2588,18 +2585,14 @@ mod tests {
     #[tokio::test]
     async fn set_thinking_effort_forwards_the_pick_to_the_agent() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(
-            tx,
-            Some(effort_capability(&["default", "high"], "default")),
-            None,
-        );
+        let provider =
+            test_provider_with_effort(tx, Some(effort_capability(&["default", "high"], "default")));
 
         let handle = tokio::spawn(async move {
-            let handled = provider
+            provider
                 .set_thinking_effort("session", "high")
                 .await
-                .unwrap();
-            (handled, provider)
+                .unwrap()
         });
 
         assert_eq!(
@@ -2607,18 +2600,13 @@ mod tests {
             ("effort".to_string(), "high".to_string())
         );
 
-        let (handled, provider) = handle.await.unwrap();
-        assert!(handled);
-        assert_eq!(
-            provider.applied_effort.lock().unwrap().as_deref(),
-            Some("high")
-        );
+        assert!(handle.await.unwrap());
     }
 
     #[tokio::test]
     async fn set_thinking_effort_is_unhandled_without_an_effort_option() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(tx, None, None);
+        let provider = test_provider_with_effort(tx, None);
 
         assert!(!provider
             .set_thinking_effort("session", "high")
@@ -2630,11 +2618,8 @@ mod tests {
     #[tokio::test]
     async fn set_thinking_effort_rejects_values_the_agent_does_not_offer() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(
-            tx,
-            Some(effort_capability(&["default", "high"], "default")),
-            None,
-        );
+        let provider =
+            test_provider_with_effort(tx, Some(effort_capability(&["default", "high"], "default")));
 
         let result = provider.set_thinking_effort("session", "medium").await;
 
@@ -2648,7 +2633,6 @@ mod tests {
         let provider = test_provider_with_effort(
             tx,
             Some(effort_capability(&["default", "low", "xhigh"], "default")),
-            None,
         );
         let model = model_with_effort("max");
 
@@ -2664,13 +2648,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_effort_if_changed_skips_when_already_applied() {
+    async fn apply_effort_if_changed_skips_when_agent_already_has_the_value() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(
-            tx,
-            Some(effort_capability(&["default", "high"], "default")),
-            Some("high".to_string()),
-        );
+        let provider =
+            test_provider_with_effort(tx, Some(effort_capability(&["default", "high"], "high")));
 
         provider
             .apply_effort_if_changed(&model_with_effort("high"))
@@ -2680,14 +2661,45 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A refresh that reverts the agent's own effort (e.g. a model switch
+    /// rebuilding per-model levels) must not be masked by a stale record of
+    /// what goose last sent: the persisted value gets re-applied.
+    #[tokio::test]
+    async fn apply_effort_if_changed_resends_after_the_agent_resets_its_effort() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let provider =
+            test_provider_with_effort(tx, Some(effort_capability(&["default", "high"], "high")));
+        refresh_effort_state(
+            &provider.effort_state,
+            &[SessionConfigOption::select(
+                "effort",
+                "Thinking",
+                "default",
+                effort_select_options(&["default", "high"]),
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel)],
+        );
+
+        let handle = tokio::spawn(async move {
+            provider
+                .apply_effort_if_changed(&model_with_effort("high"))
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(
+            expect_set_config_option(&mut rx).await,
+            ("effort".to_string(), "high".to_string())
+        );
+
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn apply_effort_if_changed_skips_unmapped_value() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(
-            tx,
-            Some(effort_capability(&["default", "high"], "default")),
-            None,
-        );
+        let provider =
+            test_provider_with_effort(tx, Some(effort_capability(&["default", "high"], "default")));
 
         provider
             .apply_effort_if_changed(&model_with_effort("medium"))
@@ -2700,7 +2712,7 @@ mod tests {
     #[tokio::test]
     async fn apply_effort_if_changed_skips_without_an_effort_option() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(tx, None, None);
+        let provider = test_provider_with_effort(tx, None);
 
         provider
             .apply_effort_if_changed(&model_with_effort("high"))
@@ -2713,11 +2725,8 @@ mod tests {
     #[tokio::test]
     async fn apply_effort_if_changed_skips_session_without_a_persisted_value() {
         let (tx, mut rx) = mpsc::channel(1);
-        let provider = test_provider_with_effort(
-            tx,
-            Some(effort_capability(&["default", "high"], "default")),
-            None,
-        );
+        let provider =
+            test_provider_with_effort(tx, Some(effort_capability(&["default", "high"], "default")));
 
         provider
             .apply_effort_if_changed(&ModelConfig::new(ACP_CURRENT_MODEL))
